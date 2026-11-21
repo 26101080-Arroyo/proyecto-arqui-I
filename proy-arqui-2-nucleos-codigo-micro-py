@@ -1,0 +1,310 @@
+"""Aforo bidireccional - Raspberry Pi Pico 2 W / MicroPython.
+
+Wokwi: SSID Wokwi-GUEST. En placa real: cambiar SSID y contraseña.
+Si no hay token Ubidots, el conteo local funciona sin nube.
+
+PROTOTIPO EDUCATIVO: no utilizar como único dispositivo de seguridad
+ni como cerradura de una salida de emergencia. Requiere salida manual.
+"""
+import time
+import network
+import ujson
+import _thread
+from machine import Pin, PWM, time_pulse_us
+
+try:
+    import urequests as requests
+except ImportError:
+    import requests
+
+# ---------------- CONFIGURACIÓN ----------------
+WIFI_SSID = "Wokwi-GUEST"
+WIFI_PASSWORD = ""
+UBIDOTS_TOKEN = "BBUS-REEMPLAZA_CON_TU_TOKEN"
+DEVICE_LABEL = "pico2w-aforo"
+UBIDOTS_URL = "https://industrial.api.ubidots.com/api/v1.6/devices/" + DEVICE_LABEL + "/"
+
+CAPACIDAD_MAXIMA = 5
+UMBRAL_CM = 80.0
+TIEMPO_CRUCE_MS = 3000
+DESPEJE_MS = 350
+INTERVALO_ENVIO_MS = 4000
+HEARTBEAT_MS = 30000
+
+# ---------------- PINES: IGUALES A diagram.json ----------------
+trig_a = Pin(2, Pin.OUT, value=0)  # Sensor A (exterior)
+echo_a = Pin(3, Pin.IN)
+trig_b = Pin(4, Pin.OUT, value=0)  # Sensor B (interior)
+echo_b = Pin(5, Pin.IN)
+pir = Pin(6, Pin.IN)
+
+servo = PWM(Pin(15))
+servo.freq(50)
+# Posiciones del ejemplo Wokwi: cerrada=0 grados, abierta=90 grados.
+SERVO_CERRADO = 1638  # duty_u16, aprox. 0.5 ms
+SERVO_ABIERTO = 4915  # duty_u16, aprox. 1.5 ms
+
+# El buzzer de Wokwi es piezoeléctrico: necesita tono PWM.
+buzzer = PWM(Pin(14))
+buzzer.freq(1800)
+buzzer.duty_u16(0)
+
+# ---------------- ESTADO COMPARTIDO ----------------
+lock = _thread.allocate_lock()
+aforo = 0
+entradas = 0
+salidas = 0
+movimiento_pir = 0
+barrera_cerrada = False
+version_datos = 1  # Primera publicación: aforo inicial 0
+version_enviada = 0
+alarma_hasta = None
+
+
+def registrar_cambio():
+    """Se usa desde el hilo principal; la red lee bajo el mismo lock."""
+    global version_datos
+    with lock:
+        version_datos += 1
+
+
+def ajustar_barrera(cerrar):
+    """Control de demostración: nunca sustituye una salida manual real."""
+    global barrera_cerrada
+    if cerrar != barrera_cerrada:
+        servo.duty_u16(SERVO_CERRADO if cerrar else SERVO_ABIERTO)
+        barrera_cerrada = cerrar
+        registrar_cambio()
+        print("[BARRERA]", "CERRADA" if cerrar else "ABIERTA")
+
+
+def sonar(ms=400):
+    global alarma_hasta
+    buzzer.duty_u16(28000)
+    alarma_hasta = time.ticks_add(time.ticks_ms(), ms)
+
+
+def actualizar_alarma(ahora):
+    global alarma_hasta
+    if alarma_hasta is not None and time.ticks_diff(ahora, alarma_hasta) >= 0:
+        buzzer.duty_u16(0)
+        alarma_hasta = None
+
+
+def distancia_cm(trig, echo):
+    trig.value(0)
+    time.sleep_us(3)
+    trig.value(1)
+    time.sleep_us(12)
+    trig.value(0)
+    try:
+        duracion = time_pulse_us(echo, 1, 26000)
+        if duracion < 0:
+            return 999.0
+        return duracion / 58.0
+    except OSError:
+        return 999.0
+
+
+def informar_pir():
+    global movimiento_pir, version_datos
+    nuevo = pir.value()
+    if nuevo != movimiento_pir:
+        with lock:
+            movimiento_pir = nuevo
+            # Se incrementa la misma versión que el conteo.
+            version_datos += 1
+        print("[PIR]", "Movimiento" if nuevo else "Sin movimiento")
+
+
+# ---------------- NÚCLEO 1: WIFI + UBIDOTS ----------------
+def tarea_iot():
+    global version_enviada
+    if "REEMPLAZA" in UBIDOTS_TOKEN or "TU_TOKEN" in UBIDOTS_TOKEN:
+        print("[UBIDOTS] Falta configurar el token; el conteo local sigue funcionando.")
+        return
+
+    wlan = network.WLAN(network.STA_IF)
+    wlan.active(True)
+    proximo_intento = None
+    proximo_envio = time.ticks_ms()
+    ultimo_ok = None
+    estaba_conectado = False
+    headers = {
+        "X-Auth-Token": UBIDOTS_TOKEN,
+        "Content-Type": "application/json"
+    }
+
+    while True:
+        ahora = time.ticks_ms()
+        if not wlan.isconnected():
+            if estaba_conectado:
+                print("[WIFI] Se perdió la conexión")
+                estaba_conectado = False
+            if proximo_intento is None or time.ticks_diff(ahora, proximo_intento) >= 0:
+                try:
+                    wlan.active(False)
+                    time.sleep_ms(150)
+                    wlan.active(True)
+                    wlan.connect(WIFI_SSID, WIFI_PASSWORD)
+                    print("[WIFI] Conectando a", WIFI_SSID)
+                except Exception as e:
+                    print("[WIFI] Error:", e)
+                proximo_intento = time.ticks_add(ahora, 12000)
+            time.sleep_ms(500)
+            continue
+
+        if not estaba_conectado:
+            estaba_conectado = True
+            print("[WIFI] Conectado, IP:", wlan.ifconfig()[0])
+            proximo_envio = time.ticks_ms()
+
+        if time.ticks_diff(ahora, proximo_envio) < 0:
+            time.sleep_ms(200)
+            continue
+
+        with lock:
+            version_objetivo = version_datos
+            necesita_envio = version_objetivo > version_enviada
+            payload = {
+                "aforo": aforo,
+                "entradas": entradas,
+                "salidas": salidas,
+                "ocupacion_pct": round(100 * aforo / CAPACIDAD_MAXIMA, 1),
+                "movimiento_pir": movimiento_pir,
+                "barrera_cerrada": int(barrera_cerrada)
+            }
+
+        latido = ultimo_ok is None or time.ticks_diff(ahora, ultimo_ok) >= HEARTBEAT_MS
+        if not necesita_envio and not latido:
+            time.sleep_ms(200)
+            continue
+
+        proximo_envio = time.ticks_add(ahora, INTERVALO_ENVIO_MS)
+        respuesta = None
+        try:
+            respuesta = requests.post(
+                UBIDOTS_URL,
+                data=ujson.dumps(payload),
+                headers=headers
+            )
+            codigo = respuesta.status_code
+            if 200 <= codigo < 300:
+                with lock:
+                    if version_objetivo > version_enviada:
+                        version_enviada = version_objetivo
+                ultimo_ok = time.ticks_ms()
+                print("[UBIDOTS] OK HTTP", codigo, payload)
+            else:
+                print("[UBIDOTS] HTTP", codigo, "- revisar token o conexión")
+        except Exception as e:
+            print("[UBIDOTS] Error de envío:", e)
+        finally:
+            if respuesta is not None:
+                respuesta.close()
+        time.sleep_ms(150)
+
+
+# ---------------- NÚCLEO 0: CONTEO BIDIRECCIONAL ----------------
+def tarea_aforo():
+    global aforo, entradas, salidas, version_datos
+    servo.duty_u16(SERVO_ABIERTO)
+    buzzer.duty_u16(0)
+    print("[INICIO] Aforo 0/{}; sensor A=EXTERIOR, B=INTERIOR".format(CAPACIDAD_MAXIMA))
+    estado = "LIBRE"
+    inicio_cruce = 0
+    inicio_despeje = None
+
+    while True:
+        informar_pir()  # El PIR solo informa; NO bloquea los cruces.
+        d_a = distancia_cm(trig_a, echo_a)
+        # Separación entre ultrasonidos para reducir interferencias físicas.
+        time.sleep_ms(60)
+        d_b = distancia_cm(trig_b, echo_b)
+        ahora = time.ticks_ms()
+        actualizar_alarma(ahora)
+        det_a = d_a < UMBRAL_CM
+        det_b = d_b < UMBRAL_CM
+
+        if estado == "LIBRE":
+            if det_a and not det_b:
+                if aforo >= CAPACIDAD_MAXIMA:
+                    estado = "ENTRADA_BLOQUEADA"
+                    inicio_cruce = ahora
+                    sonar(450)
+                    print("[AFORO COMPLETO] Entrada bloqueada:", aforo)
+                else:
+                    estado = "ENTRANDO"
+                    inicio_cruce = ahora
+                    print("[DETECCIÓN] A -> esperando B")
+
+            elif det_b and not det_a:
+                estado = "SALIENDO"
+                inicio_cruce = ahora
+                if barrera_cerrada:
+                    ajustar_barrera(False)  # Priorizar salida.
+                print("[DETECCIÓN] B -> esperando A")
+
+        elif estado == "ENTRANDO":
+            if det_b:
+                with lock:
+                    if aforo < CAPACIDAD_MAXIMA:
+                        aforo += 1
+                        entradas += 1
+                        version_datos += 1
+                        print("[ENTRADA] Aforo: {}/{}".format(aforo, CAPACIDAD_MAXIMA))
+                        if aforo == CAPACIDAD_MAXIMA:
+                            sonar(550)
+                            print("[COMPLETO] Cerrar al despejar ambos sensores")
+                estado = "ESPERAR_DESPEJE"
+                inicio_despeje = None
+            elif time.ticks_diff(ahora, inicio_cruce) > TIEMPO_CRUCE_MS:
+                print("[ENTRADA] Incompleta; no se contó")
+                estado = "ESPERAR_DESPEJE"
+                inicio_despeje = None
+
+        elif estado == "SALIENDO":
+            if det_a:
+                with lock:
+                    if aforo > 0:
+                        aforo -= 1
+                        salidas += 1
+                        version_datos += 1
+                        print("[SALIDA] Aforo: {}/{}".format(aforo, CAPACIDAD_MAXIMA))
+                    else:
+                        print("[SALIDA] Aforo ya estaba en 0")
+                estado = "ESPERAR_DESPEJE"
+                inicio_despeje = None
+            elif time.ticks_diff(ahora, inicio_cruce) > TIEMPO_CRUCE_MS:
+                print("[SALIDA] Incompleta; no se contó")
+                estado = "ESPERAR_DESPEJE"
+                inicio_despeje = None
+
+        elif estado == "ENTRADA_BLOQUEADA":
+            # Nunca incrementa el contador en 5/5. Espera la retirada.
+            if not det_a and not det_b:
+                estado = "ESPERAR_DESPEJE"
+                inicio_despeje = None
+
+        elif estado == "ESPERAR_DESPEJE":
+            if not det_a and not det_b:
+                if inicio_despeje is None:
+                    inicio_despeje = ahora
+                elif time.ticks_diff(ahora, inicio_despeje) >= DESPEJE_MS:
+                    ajustar_barrera(aforo >= CAPACIDAD_MAXIMA)
+                    estado = "LIBRE"
+                    inicio_despeje = None
+            else:
+                inicio_despeje = None
+
+        # La tarea de red corre en el otro núcleo; este hilo nunca hace HTTP.
+        time.sleep_ms(35)
+
+
+try:
+    _thread.start_new_thread(tarea_iot, ())
+except Exception as e:
+    print("[IOT] No se pudo iniciar el núcleo 1:", e)
+    print("[IOT] El conteo local sigue funcionando")
+
+tarea_aforo()
