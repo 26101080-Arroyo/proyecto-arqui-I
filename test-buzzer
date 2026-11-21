@@ -1,0 +1,60 @@
+from machine import Pin, PWM
+import time
+
+buzzer = PWM(Pin(14))
+buzzer.duty_u16(0)
+
+def syllable(start_freq, end_freq, duration):
+    steps = 20
+
+    for i in range(steps):
+        freq = start_freq + (
+            (end_freq - start_freq) * i // steps
+        )
+
+        buzzer.freq(int(freq))
+        buzzer.duty_u16(12000)
+        time.sleep(duration / steps)
+
+    buzzer.duty_u16(0)
+    time.sleep(0.05)
+
+
+def robot_voice():
+    print("ROBOT: MAXIMUM CAPACITY REACHED")
+
+    # MAX-I-MUM
+    syllable(900, 1400, 0.25)
+    syllable(1300, 900, 0.15)
+    syllable(900, 650, 0.25)
+
+    time.sleep(0.20)
+
+    # CA-PA-CI-TY
+    syllable(750, 1200, 0.20)
+    syllable(1200, 950, 0.20)
+    syllable(1300, 1600, 0.15)
+    syllable(1100, 750, 0.25)
+
+    time.sleep(0.20)
+
+    # REACHED: repetir 5 veces
+    for i in range(3):
+        print("REACHED", i + 1)
+        syllable(1500, 600, 0.85)
+        time.sleep(0.15)
+
+
+try:
+    while True:
+        robot_voice()
+
+        print("Reiniciando mensaje...")
+        time.sleep(2)
+
+except KeyboardInterrupt:
+    print("Alarma detenida")
+
+finally:
+    buzzer.duty_u16(0)
+    buzzer.deinit()
