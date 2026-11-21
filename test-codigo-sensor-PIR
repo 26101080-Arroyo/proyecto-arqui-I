@@ -1,0 +1,17 @@
+from machine import Pin
+import time
+
+pir = Pin(6, Pin.IN)
+
+print("Estabilizando PIR...")
+time.sleep(60)
+
+while True:
+    valor = pir.value()
+
+    if valor == 1:
+        print("Movimiento detectado")
+    else:
+        print("Sin movimiento")
+
+    time.sleep(1)
