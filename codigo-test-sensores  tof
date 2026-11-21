@@ -1,0 +1,20 @@
+from machine import Pin, I2C
+import time
+
+# Sensor A - Exterior
+i2c_a = I2C(1, sda=Pin(2), scl=Pin(3), freq=100000)
+
+# Sensor B - Interior
+i2c_b = I2C(0, sda=Pin(4), scl=Pin(5), freq=100000)
+
+while True:
+    print("------ PRUEBA DE SENSORES ------")
+
+    print("Sensor A:", i2c_a.scan())
+    print("Sensor B:", i2c_b.scan())
+
+    time.sleep(2)
+  # Prueba exitosa:
+  #------ PRUEBA DE SENSORES ------
+  #Sensor A: [41]
+  # Sensor B: [41]
